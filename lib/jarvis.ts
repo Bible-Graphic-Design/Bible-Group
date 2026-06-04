@@ -2,8 +2,8 @@
 // 假设：OpenAI 兼容协议 (Bearer Token + /v1/...)
 // 真实接入后如果协议不同,只需改本文件
 
-import type { ModeDef, ModeId, ModelId, Quality, Ratio } from './types';
-import { resolveModel } from './modes';
+import type { ModeId, ModelId, Quality, Ratio } from './types';
+import { resolveModel, type ModeDef } from './modes';
 import { RATIO_PX, QUALITY_SCALE } from './types';
 
 const BASE_URL = process.env.JARVIS_BASE_URL || 'https://gateway.ddit.ai';
