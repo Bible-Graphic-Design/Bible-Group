@@ -1,13 +1,10 @@
-// jarvis 网关适配层
-// gemini 走 /v1/chat/completions + multimodal(图进图出)
-// gpt-image-2 / seedream-4 走 /v1/images/edits
-// claude 走 /v1/chat/completions
-
+// jarvis 网关适配层 - v3
 import type { ModeId, ModelId, Quality, Ratio } from './types';
 import { resolveModel, type ModeDef } from './modes';
 import { RATIO_PX, QUALITY_SCALE } from './types';
 
 const BASE_URL = process.env.JARVIS_BASE_URL || 'https://gateway.ddit.ai';
+const TIMEOUT_MS = 50_000;
 
 function getKey(): string {
   const key = process.env.JARVIS_API_KEY;
@@ -20,6 +17,16 @@ function authHeaders() {
     'Authorization': `Bearer ${getKey()}`,
     'Content-Type': 'application/json',
   };
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
 }
 
 export interface GenerateInput {
@@ -45,15 +52,12 @@ export interface GenerateOutput {
 export function buildPrompt(input: GenerateInput): string {
   const parts: string[] = [];
   parts.push(input.modeDef.prompt);
-
   if (input.market) {
     parts[0] = parts[0].replace(/\{\{market\}\}/g, input.market);
   }
-
   if (input.styles && input.styles.length) {
     parts.push(`\nSTYLE PRESETS (apply all): ${input.styles.join(' / ')}`);
   }
-
   if (input.font && (input.font.family || input.font.custom || input.font.weight || (input.font.case && input.font.case !== 'as-is'))) {
     const fontDesc: string[] = [];
     if (input.font.custom) fontDesc.push(`font name: "${input.font.custom}"`);
@@ -62,63 +66,64 @@ export function buildPrompt(input: GenerateInput): string {
     if (input.font.case && input.font.case !== 'as-is') fontDesc.push(`case: ${input.font.case}`);
     parts.push(`\nFONT CUSTOMIZATION: ${fontDesc.join(', ')}`);
   }
-
   if (input.extraPrompt && input.extraPrompt.trim()) {
     parts.push(`\nADDITIONAL INSTRUCTION: ${input.extraPrompt.trim()}`);
   }
-
+  parts.push(`\n\nIMPORTANT OUTPUT REQUIREMENT: You MUST return the result as an IMAGE, not as text description. Generate and output the modified image directly.`);
   return parts.join('\n');
 }
 
 export async function generate(input: GenerateInput): Promise<GenerateOutput> {
   const model = resolveModel(input.modeId, input.userModel);
   const prompt = buildPrompt(input);
-
   if (model.startsWith('gemini-') || model.startsWith('claude-')) {
     return await callChat(model, prompt, input);
   }
   return await callImage(model, prompt, input);
 }
 
-async function callChat(
-  model: ModelId,
-  prompt: string,
-  input: GenerateInput
-): Promise<GenerateOutput> {
+async function callChat(model: ModelId, prompt: string, input: GenerateInput): Promise<GenerateOutput> {
   const url = `${BASE_URL}/v1/chat/completions`;
   const body = {
     model,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: input.referenceUrl } },
-        ],
-      },
-    ],
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: input.referenceUrl } },
+      ],
+    }],
+    modalities: ['text', 'image'],
   };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify(body),
-  });
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
+    });
+  } catch (e: any) {
+    if (e?.name === 'AbortError') throw new Error(`jarvis chat 超时(${TIMEOUT_MS}ms),模型响应太慢`);
+    throw e;
+  }
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`jarvis chat ${res.status}: ${errText}`);
+    throw new Error(`jarvis chat ${res.status}: ${errText.slice(0, 500)}`);
   }
   const json: any = await res.json();
   const message = json?.choices?.[0]?.message;
   const text: string = message?.content || '';
-
   const imageUrl =
     message?.image_url ||
+    (Array.isArray(message?.content) && message.content.find((c: any) => c.type === 'image_url')?.image_url?.url) ||
+    (Array.isArray(message?.content) && message.content.find((c: any) => c.type === 'image_url')?.image_url) ||
     json?.images?.[0]?.url ||
     json?.data?.[0]?.url ||
+    (json?.images?.[0]?.b64_json && `data:image/png;base64,${json.images[0].b64_json}`) ||
     extractImageFromText(text);
-
   if (imageUrl) {
     return { model, imageUrl, text: text || undefined, raw: json };
+  }
+  if (!text) {
+    throw new Error(`jarvis 返回结构异常,无图无文: ${JSON.stringify(json).slice(0, 400)}`);
   }
   return { model, text, raw: json };
 }
@@ -134,32 +139,24 @@ function extractImageFromText(text: string): string | undefined {
   return undefined;
 }
 
-async function callImage(
-  model: ModelId,
-  prompt: string,
-  input: GenerateInput
-): Promise<GenerateOutput> {
+async function callImage(model: ModelId, prompt: string, input: GenerateInput): Promise<GenerateOutput> {
   const [w, h] = RATIO_PX[input.ratio];
   const scale = QUALITY_SCALE[input.quality];
   const size = `${w * scale}x${h * scale}`;
-
   const url = `${BASE_URL}/v1/images/edits`;
-  const body: any = {
-    model,
-    prompt,
-    n: 1,
-    size,
-    image: input.referenceUrl,
-  };
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify(body),
-  });
+  const body: any = { model, prompt, n: 1, size, image: input.referenceUrl };
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
+    });
+  } catch (e: any) {
+    if (e?.name === 'AbortError') throw new Error(`jarvis image 超时(${TIMEOUT_MS}ms),模型响应太慢`);
+    throw e;
+  }
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`jarvis image ${res.status}: ${errText}`);
+    throw new Error(`jarvis image ${res.status}: ${errText.slice(0, 500)}`);
   }
   const json: any = await res.json();
   const imageUrl =
@@ -169,7 +166,7 @@ async function callImage(
     json?.images?.[0]?.url ||
     json?.url;
   if (!imageUrl) {
-    throw new Error(`jarvis image 返回未找到图片 URL,原始: ${JSON.stringify(json).slice(0, 300)}`);
+    throw new Error(`jarvis image 返回未找到图片 URL,原始: ${JSON.stringify(json).slice(0, 400)}`);
   }
   return { model, imageUrl, raw: json };
 }
