@@ -1,6 +1,7 @@
 // jarvis 网关适配层
-// 假设：OpenAI 兼容协议 (Bearer Token + /v1/...)
-// 真实接入后如果协议不同,只需改本文件
+// gemini 走 /v1/chat/completions + multimodal(图进图出)
+// gpt-image-2 / seedream-4 走 /v1/images/edits
+// claude 走 /v1/chat/completions
 
 import type { ModeId, ModelId, Quality, Ratio } from './types';
 import { resolveModel, type ModeDef } from './modes';
@@ -27,28 +28,20 @@ export interface GenerateInput {
   userModel?: ModelId;
   ratio: Ratio;
   quality: Quality;
-  market?: string;        // EN / ES / PT / FR
+  market?: string;
   extraPrompt?: string;
   styles?: string[];
   font?: { family?: string; weight?: string; case?: string; custom?: string };
-  /** 参考图 URL (Supabase Storage public URL) */
   referenceUrl: string;
 }
 
 export interface GenerateOutput {
-  /** 生成的图片 URL（来自 jarvis 返回，前端会直接用） */
   imageUrl?: string;
-  /** 文本类返回（改文案/翻译可能直接给文本，需要前端二次处理） */
   text?: string;
-  /** 实际使用的模型 ID */
   model: ModelId;
-  /** 用于调试的原始响应 */
   raw?: any;
 }
 
-/**
- * 组合最终发给模型的 prompt
- */
 export function buildPrompt(input: GenerateInput): string {
   const parts: string[] = [];
   parts.push(input.modeDef.prompt);
@@ -77,19 +70,13 @@ export function buildPrompt(input: GenerateInput): string {
   return parts.join('\n');
 }
 
-/**
- * 主入口 — 调用 jarvis 生成
- */
 export async function generate(input: GenerateInput): Promise<GenerateOutput> {
   const model = resolveModel(input.modeId, input.userModel);
   const prompt = buildPrompt(input);
 
-  // 文本类方向 走 chat completions（claude）
-  if (input.modeId === 'rewrite-copy' || input.modeId === 'i18n') {
+  if (model.startsWith('gemini-') || model.startsWith('claude-')) {
     return await callChat(model, prompt, input);
   }
-
-  // 图像类方向 走 image generation
   return await callImage(model, prompt, input);
 }
 
@@ -121,8 +108,30 @@ async function callChat(
     throw new Error(`jarvis chat ${res.status}: ${errText}`);
   }
   const json: any = await res.json();
-  const text = json?.choices?.[0]?.message?.content || '';
+  const message = json?.choices?.[0]?.message;
+  const text: string = message?.content || '';
+
+  const imageUrl =
+    message?.image_url ||
+    json?.images?.[0]?.url ||
+    json?.data?.[0]?.url ||
+    extractImageFromText(text);
+
+  if (imageUrl) {
+    return { model, imageUrl, text: text || undefined, raw: json };
+  }
   return { model, text, raw: json };
+}
+
+function extractImageFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const dataMatch = text.match(/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/);
+  if (dataMatch) return dataMatch[0];
+  const mdMatch = text.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/);
+  if (mdMatch) return mdMatch[1];
+  const urlMatch = text.match(/https?:\/\/\S+\.(?:png|jpg|jpeg|webp|svg)/i);
+  if (urlMatch) return urlMatch[0];
+  return undefined;
 }
 
 async function callImage(
@@ -134,15 +143,13 @@ async function callImage(
   const scale = QUALITY_SCALE[input.quality];
   const size = `${w * scale}x${h * scale}`;
 
-  // 走 OpenAI 兼容的 images/edits（因为有参考图）
-  // 不同的网关可能用不同字段名 — 真接入时根据返回报错调整
-  const url = `${BASE_URL}/v1/images/generations`;
+  const url = `${BASE_URL}/v1/images/edits`;
   const body: any = {
     model,
     prompt,
     n: 1,
     size,
-    image: input.referenceUrl, // 部分网关用 image_url
+    image: input.referenceUrl,
   };
 
   const res = await fetch(url, {
@@ -158,10 +165,11 @@ async function callImage(
   const imageUrl =
     json?.data?.[0]?.url ||
     json?.data?.[0]?.image_url ||
+    (json?.data?.[0]?.b64_json && `data:image/png;base64,${json.data[0].b64_json}`) ||
     json?.images?.[0]?.url ||
     json?.url;
   if (!imageUrl) {
-    throw new Error(`jarvis 返回未找到图片 URL,原始: ${JSON.stringify(json).slice(0, 200)}`);
+    throw new Error(`jarvis image 返回未找到图片 URL,原始: ${JSON.stringify(json).slice(0, 300)}`);
   }
   return { model, imageUrl, raw: json };
 }
