@@ -9,7 +9,7 @@ import type { ModeId, ModelId, Quality, Ratio } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
   try {
