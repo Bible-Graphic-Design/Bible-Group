@@ -9,7 +9,7 @@ import type { ModeId, ModelId, Quality, Ratio } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 300; // 单次最多 5 分钟,生成图片偶尔较慢
+export const maxDuration = 60; // Vercel Hobby 计划上限是 60 秒
 
 /* GET — 列出任务（支持按 zone_id 过滤） */
 export async function GET(req: NextRequest) {
